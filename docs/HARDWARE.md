@@ -61,18 +61,31 @@ The user explicitly chose to operate without NVLink. Don't suggest adding one.
 
 ## Power
 
-Production target: **330W per card** is the sweet spot — peak TPS/W efficiency and only ~5% TPS loss vs unrestricted stock (~388W).
+Production target: **290W (air-cooled) / 330W (water-cooled) per card** is the sweet spot — peak TPS/W efficiency and only ~5-7% TPS loss vs unrestricted stock.
 
 Power lever:
 ```bash
 sudo nvidia-smi -pm 1            # one-time: enable persistence mode
-sudo nvidia-smi -pl 330 -i 0     # production default (recommended for both vLLM and llama.cpp)
-sudo nvidia-smi -pl 230 -i 0     # thermal-constrained / quiet — see caveat below
+sudo nvidia-smi -pl 290 -i 0     # air-cooled default (per 21-cap 10W-resolution sweep, this rig)
+sudo nvidia-smi -pl 330 -i 0     # water-cooled default (per @syangsao 3-cap data)
+sudo nvidia-smi -pl 250 -i 0     # prefill-heavy / RAG workloads — different sweet spot, see below
 ```
 
-Past 330W: diminishing returns (SM clocks saturate near 1.9 GHz on 3090s); 388W is actually *less* efficient than 330W on Qwen3.6's GDN-attention kernels.
+Past the sweet spot: diminishing returns (SM clocks saturate near 1.9 GHz on 3090s); stock TDP is *less* efficient than the sweet-spot cap on Qwen3.6's GDN-attention kernels.
 
-**Caveat — 230W on llama.cpp + GDN models is more aggressive than it looks**: cross-rig data from [@syangsao](https://github.com/noonghunna/club-3090/issues/58#issuecomment-4388766174) (1× water-cooled 3090, llama.cpp + Qwen3.6 Q3_K_XL) shows **230W costs ~34% TPS** vs stock (25 vs 38 TPS) because the chunked_gated_delta_rule kernel is genuinely compute-bound on this model, not memory-bound. On vLLM + AutoRound the same cap costs less (~10-15%) because the kernel mix is GEMM-dominated. **Recommendation**: use 330W as the default cap on either engine. Drop to 230W only if you're more thermal-constrained than perf-constrained, and expect the larger penalty on llama.cpp.
+**The "230W is the sweet spot" lore is wrong** — it traces back to early thermal-constrained recommendations and 3-cap-resolution data. Dense 10W sweeps show 230W costs ~16% efficiency vs 290W (decode) and ~4% vs 250W (prefill) on this rig. 230W is a *low-power / quiet* cap, not an efficient one. Use it only if your goal is thermal/acoustic, not perf-per-watt.
+
+**Sweet spot varies by workload class** — same card, same engine, same model:
+
+| Workload | Air-cooled 3090 sweet spot | Notes |
+|---|---:|---|
+| Decode-single (chat / IDE agent) | **290W** (0.111 TPS/W) | -7% TPS vs 370W stock for -22% wattage |
+| Decode-concurrent (multi-stream) | **290W** (0.110 TPS/W) | Same knee as decode-single — concurrency doesn't move it |
+| Prefill-heavy (RAG / long-context) | **250W** (3.617 TPS/W) | Compute-bound; the 250W cap squeezes the curve harder |
+
+Mixed workloads: pick 290W (the prefill cost at 290W is only -5% vs prefill's own 250W sweet spot, while decode at 250W loses -10% vs its 290W sweet spot — 290W is the better compromise).
+
+**Caveat — 230W on llama.cpp + GDN models is more aggressive than it looks**: cross-rig data from [@syangsao](https://github.com/noonghunna/club-3090/issues/58#issuecomment-4388766174) (1× water-cooled 3090, llama.cpp + Qwen3.6 Q3_K_XL) shows **230W costs ~34% TPS** vs stock (25 vs 38 TPS) because the chunked_gated_delta_rule kernel is genuinely compute-bound on this model, not memory-bound. On vLLM + AutoRound the same cap costs less (~10-15%) because the kernel mix is GEMM-dominated. **Recommendation**: use 290W (air) / 330W (water) as the default cap on either engine. Drop to 230W only if you're more thermal-constrained than perf-constrained, and expect the larger penalty on llama.cpp.
 
 **Cooling caveat**: the 388W stock numbers above are from a water-cooled rig (Alphacool Eiswolf 2 AIO 360mm) — that's what lets the card actually sustain full board power. On **air-cooled 3090s**, thermal throttling typically kicks in at ~80°C and drops effective power to ~310-340W under sustained decode load even with no software cap, so 388W → 330W gap mostly disappears — your "stock" was likely already 330W-equivalent. The 330W cap mainly helps liquid-cooled rigs by keeping the card cooler + quieter at near-zero perf cost; on air-cooled it's a soft no-op that just makes the throttling explicit.
 
@@ -100,6 +113,22 @@ sudo bash scripts/power-cap-sweep.sh \
   --bench-runs 3
 ```
 
+### Recommended sweep chain — when to run each mode
+
+For a single-rig anchor (cross-rig contribution): **one mode is fine** — pick the one that matches your dominant workload class.
+
+For full workload-class characterization on **your** rig: **run two modes** (~14 min total). The decode and prefill sweet spots can differ — same hardware, different compute/bandwidth ratio per workload class. We measured 290W decode vs 250W prefill on the same 3090 (40W gap); apnar's 5090 showed 400W for both decode and prefill (workload-independent on Blackwell). You won't know which pattern your rig follows without running both.
+
+| If you're optimizing for | Run this mode | Sweep wall (3090) |
+|---|---|---:|
+| Chat / IDE-agent / single-stream | `--load-mode decode-single` | ~8 min |
+| RAG / long-context / batch | `--load-mode prefill-heavy` | ~6 min |
+| Multi-tenant (3+ concurrent users) | `--load-mode decode-concurrent --concurrency auto` | ~8 min |
+
+**Pick a cap that's the min across the modes you care about** — e.g. if you care about both chat AND RAG on a 3090, `min(290W, 250W) = 250W` is the safer pick that stays efficient on either workload class. Costs ~5% TPS on the chat workload but keeps prefill at its sweet spot.
+
+**Plateau detection** (since 2026-05-07): the script now auto-detects boost-clock plateaus (3+ adjacent caps with identical draw + TPS within ±1%) and emits a `[plateau detected]` line plus a "Detected boost-clock plateau(s)" section in the summary file. If your rig shows a plateau, the caps inside it are functionally equivalent — pick the **lowest** cap in the plateau range to save power for free TPS.
+
 How `decode-single` is timed (the new default since 2026-05-07):
 - **Time-bounded streaming bench**: 10s narrative + 10s code per cap (configurable via `--target-cap-seconds`). Per-cap wall is constant ~23s regardless of cap or card class.
 - **Cross-card portable**: a 3090 sweep (190-390W, 21 caps) takes ~8 min; a 5090 sweep (300-600W, 31 caps) ~12 min; a 4090 sweep (230-600W, 38 caps) ~15 min — runtime scales linearly with cap count, not throttle severity.
@@ -114,9 +143,18 @@ How `decode-single` is timed (the new default since 2026-05-07):
 | 3090 | water | llama.cpp default | Qwen3.6 27B Q3_K_XL | 230W | 25.15 | 24.86 | 0.109 | [@syangsao #58](https://github.com/noonghunna/club-3090/issues/58#issuecomment-4388766174) |
 | 3090 | water | llama.cpp default | Qwen3.6 27B Q3_K_XL | **330W** ⭐ | 36.35 | 36.26 | 0.110 | [@syangsao #58](https://github.com/noonghunna/club-3090/issues/58#issuecomment-4388766174) |
 | 3090 | water | llama.cpp default | Qwen3.6 27B Q3_K_XL | 388W (stock) | 38.23 | 37.97 | 0.098 | [@syangsao #58](https://github.com/noonghunna/club-3090/issues/58#issuecomment-4388766174) |
-| 3090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | **290W** ⭐ | 32.16 | 32.06 | **0.111** | @noonghunna (this rig, 21-cap 10W sweep, time-bounded bench) |
-| 3090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | 370W (stock) | 34.36 | 34.26 | 0.103 | same |
-| 3090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | 390W (max) | 36.06 | 35.96 | 0.093 | same |
+| 3090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | **290W** ⭐ | 32.26 | 32.17 | **0.111** | @noonghunna (this rig, 21-cap 10W sweep, time-bounded bench, SM 1380 MHz at sweet spot) |
+| 3090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | 370W (stock) | 34.66 | 34.67 | 0.104 | same — SM locks at 1560 MHz across 340-370W (boost-clock plateau) |
+| 3090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | 390W (max) | 36.26 | 36.06 | 0.093 | same — SM 1680 MHz at 388W draw |
+| 3090 | air | llama.cpp `decode-concurrent` N=4 | Qwen3.6 27B Q3_K_XL | **290W** ⭐ | 31.74 | 29.98 | **0.110** | @noonghunna (this rig, 21-cap, 4-stream aggregate, 8m wall) |
+| 3090 | air | llama.cpp `decode-concurrent` N=4 | Qwen3.6 27B Q3_K_XL | 370W (stock) | 34.13 | 32.46 | 0.102 | same |
+| 3090 | air | llama.cpp `prefill-heavy` (Qwen3.6-27B) | **prefill-heavy** | **250W** ⭐ | 906.79 | (n/a) | **3.633** | @noonghunna (this rig, 21-cap adaptive sweep, ~6m, SM 1350 MHz at sweet spot) |
+| 3090 | air | llama.cpp `prefill-heavy` (Qwen3.6-27B) | **prefill-heavy** | 370W (stock) | 1051.07 | (n/a) | 3.211 | same — SM locks at 1605-1620 MHz across 330-370W (boost-clock plateau, 327W draw) |
+| 3090 | air | llama.cpp `prefill-heavy` (Qwen3.6-27B) | **prefill-heavy** | 390W (max) | 1104.81 | (n/a) | 2.898 | same — SM 1710 MHz at 381W draw |
+| 3090 | air | llama.cpp default | **Qwen3.6 35B-A3B (MoE)** Q4_K_XL | **210W** ⭐ | 114.59 | 113.79 | **0.546** | @noonghunna (MoE shifts decode sweet spot 80W lower vs dense, SM 1290 MHz, no plateau) |
+| 3090 | air | llama.cpp default | Qwen3.6 35B-A3B (MoE) Q4_K_XL | 370W (stock) | 136.84 | 136.65 | 0.386 | same — SM climbs smoothly 1875→1905 across 340-370W (NO plateau, unlike dense) |
+| 3090 | air | llama.cpp `prefill-heavy` (35B-A3B MoE) | **prefill-heavy** | **250W** ⭐ | 2461.22 | (n/a) | **9.865** | @noonghunna (MoE prefill knee at SAME 250W as dense — workload-class converges, SM 1380 MHz) |
+| 3090 | air | llama.cpp `prefill-heavy` (35B-A3B MoE) | **prefill-heavy** | 370W (stock) | 2794.36 | (n/a) | 8.363 | same — SM locks at 1680-1710 MHz across 340-370W (boost-clock plateau detected) |
 | 4090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | **260W** ⭐ | 48.41 | 48.43 | 0.186 | [@laurimyllari #62](https://github.com/noonghunna/club-3090/discussions/62#discussioncomment-16832066) |
 | 4090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | 280W | 49.54 | 49.10 | 0.177 | [@laurimyllari #62](https://github.com/noonghunna/club-3090/discussions/62#discussioncomment-16832066) |
 | 4090 | air | llama.cpp default | Qwen3.6 27B Q3_K_XL | 300W | 50.26 | 50.02 | 0.168 | [@laurimyllari #62](https://github.com/noonghunna/club-3090/discussions/62#discussioncomment-16832066) |
@@ -158,11 +196,82 @@ The cross-workload pattern: **both workload classes have efficiency knee at 400W
 
 ![3090 + Qwen3.6-27B + llama.cpp power-cap efficiency curve (noonghunna)](img/power-cap-3090-qwen36.png)
 
-*3090 air-cooled + Qwen3.6-27B Q3_K_XL + mainline llama.cpp, 21-cap sweep 190-390W via time-bounded streaming bench (10s/direction). **Total wall: 8m12s.** Yellow callout: 290W sweet spot (0.111 TPS/W) at **78% of stock 370W TDP**. Orange-shaded zone 340-370W: firmware boost-state plateau where caps 340/350/360/370W all draw identical ~334W actual. At 380W cap, draw escapes to 361W; at 390W cap, draw reaches 388W — so the apparent "ceiling" at 334W isn't a hardware limit, it's a discrete boost-state behavior. GPU temp peaked at 76°C at 390W cap (air-cooled, no thermal throttle within the 0-100% util envelope). Source script: [`img/power-cap-3090-qwen36.py`](img/power-cap-3090-qwen36.py).*
+*3090 air-cooled + Qwen3.6-27B Q3_K_XL + mainline llama.cpp, 21-cap sweep 190-390W via time-bounded streaming bench (10s/direction). **Total wall: ~8m.** Yellow callout: 290W sweet spot (0.111 TPS/W, SM 1380 MHz) at **78% of stock 370W TDP**. Orange-shaded zone 340-370W: firmware **boost-clock plateau** — directly evidenced by the new SM-clock sampling: caps 340/350/360/370W all lock SM at exactly 1560 MHz, draw 334W actual, produce 34.66 TPS. Throttle stays at 100% across the plateau, meaning the firmware *is* power-capping, but the cap it enforces is its own internal voltage/clock setpoint, not the user-set software cap. Plateau escapes at 380W cap → SM jumps to 1635 MHz → draw to 361W → TPS to 35.56. So the "ceiling" at 334W isn't a hardware limit, it's a firmware boost-state lock that releases only at the next cap step. GPU temp peaked at 74°C at 390W cap. Source script: [`img/power-cap-3090-qwen36.py`](img/power-cap-3090-qwen36.py).*
 
-**Cross-rig pattern**: efficiency knee falls at **~60-85% of stock TDP** across consumer Ampere/Ada — start there for a new card class and zoom in. Ada (4090) is proportionally more aggressive than Ampere (3090) — 4090 cuts 33% of stock TDP for ~7% TPS loss; 3090 cuts 15% of stock for ~5% loss.
+![3090 + Qwen3.6 + llama.cpp prefill-heavy power-cap efficiency curve (noonghunna)](img/power-cap-3090-prefill.png)
+
+*3090 air-cooled + Qwen3.6-27B Q3_K_XL + mainline llama.cpp, 21-cap **prefill-heavy** sweep 190-390W via adaptive prompt calibration (probe TPS at 390W → size prompt for 10s prefill at high cap → 11K-token prompt used across all caps). **Total wall: ~6m.** Yellow callout: **250W sweet spot (3.633 prefill TPS/W, SM 1350 MHz)** at **68% of stock TDP** — different sweet spot than decode-single's 290W on the same rig because prefill is more compute-bound and reaches diminishing returns earlier. Boost-clock plateau visible at 330-370W: SM clock locks at 1605-1620 MHz across all five caps with identical 327W draw + 1050 prefill TPS. Plateau escapes at 380W → SM 1665 MHz, draw 355W, TPS 1080. Companion to the decode chart above; together they show **same card has different power-knee for different workload class** — and both workloads share the same firmware boost-clock plateau pattern, just with slightly different clock setpoints.*
+
+#### Same hardware, MoE workload — sweet spot shifts 80W lower for decode
+
+Running the same sweep on **Qwen3.6-35B-A3B (MoE, 3B active params per token)** on the same 3090 GPU 0 reveals that **model architecture moves the sweet spot meaningfully**:
+
+![3090 + Qwen3.6-35B-A3B (MoE) + llama.cpp decode-single power-cap curve (noonghunna)](img/power-cap-3090-a3b-decode.png)
+
+*3090 air-cooled + Qwen3.6-35B-A3B Q4_K_XL + mainline llama.cpp, 21-cap decode-single sweep, time-bounded bench. **Total wall: ~8m.** Yellow callout: **210W sweet spot (0.546 TPS/W, SM 1290 MHz)** at **57% of stock 370W TDP** — that's **80W lower than the dense Qwen3.6-27B sweet spot at 290W** on the same hardware. Purple-shaded zone 340-370W: **NO boost-clock plateau** — SM clock climbs smoothly 1875→1890→1890→1905 across that cap range (vs the dense Qwen which locks at exactly 1560 MHz). Plateau auto-detection correctly flagged dense Qwen but did NOT flag A3B. Source script: [`img/power-cap-3090-a3b-decode.py`](img/power-cap-3090-a3b-decode.py).*
+
+![3090 + Qwen3.6-35B-A3B (MoE) + llama.cpp prefill-heavy power-cap curve (noonghunna)](img/power-cap-3090-a3b-prefill.png)
+
+*3090 air-cooled + A3B Q4_K_XL + mainline llama.cpp at -c 65536, 21-cap **prefill-heavy** sweep with adaptive prompt calibration (~31K-token prompt sized for 10s prefill at 390W cap). **Total wall: ~6m.** Yellow callout: **250W sweet spot (9.865 prefill TPS/W, SM 1380 MHz)** — **same cap as dense Qwen3.6-27B prefill** (also 250W). Boost-clock plateau auto-detected at 340-370W: SM 1680-1710 MHz, 334W draw, 2802 TPS. So both dense and MoE share the prefill plateau pattern, just at different SM clock setpoints. Source script: [`img/power-cap-3090-a3b-prefill.py`](img/power-cap-3090-a3b-prefill.py).*
+
+**Two findings from this comparison** (same hardware, same engine, same Q4-class quant, only model changes):
+
+| Workload | Dense (27B) sweet spot | MoE (A3B) sweet spot | Plateau on dense? | Plateau on MoE? |
+|---|---:|---:|:---:|:---:|
+| **Decode-single** | 290W | **210W** (–80W) | ✅ SM 1560 MHz | ❌ no plateau |
+| **Prefill-heavy** | 250W | **250W** (same) | ✅ SM 1605-1620 | ✅ SM 1680-1710 |
+
+1. **MoE shifts the decode sweet spot 80W lower** because each token only activates 3B of the 35B params — much less per-token compute than dense, so the bandwidth-bound knee fires at lower power. The prefill sweet spot stays at 250W on both because prefill is compute-bound regardless (the full per-layer matmul still happens, MoE routing only affects which experts compute).
+
+2. **Boost-clock plateau is workload-AND-model dependent**: dense decode has it (SM 1560 MHz lock 340-370W), A3B decode does not (SM climbs smoothly). The firmware's choice of operating point responds to the instruction-mix profile, not just to the cap value. Both models exhibit the plateau on prefill (where compute pressure is high), neither model exhibits it for short-prompt decode on smaller compute pressure.
+
+**Practical implication**: cap recommendations should be model-class aware. A user running A3B as their primary chat model on 3090 should cap at **210W** (49 W less than dense Qwen's 290W recommendation) and gain the same efficiency win plus a 5°C cooler operating temperature.
+
+**Cross-rig pattern**: efficiency knee falls at **~60-85% of stock TDP** across consumer Ampere/Ada — start there for a new card class and zoom in. Ada (4090) is proportionally more aggressive than Ampere (3090) — 4090 cuts 33% of stock TDP for ~7% TPS loss; 3090 cuts 15% of stock for ~5% loss. **MoE-class models lower this further**: A3B sweet spot at 57% of stock TDP for decode (vs 78% for dense on the same card).
 
 **5090 compute-saturation note**: @apnar's data shows the 5090 caps at ~430W actual draw on Qwen3.6-27B even when allowed up to 575W — the workload is compute-saturated, not power-saturated. So 400W cap delivers ~equal TPS to 575W. **Confirmed cross-workload on Gemma 4 31B + MTP**: 21-cap sweep at 10W resolution shows actual draw plateaus at ~547W beyond 530W cap (no thermal throttle, GPU temp peaked 66°C — compute / memory bandwidth limit, not thermal). **Same 400W sweet spot** despite ~5× different absolute TPS class. Pattern: the 5090 + consumer-air-cooled platform appears to have a workload-independent ~400W efficiency knee on this rig class.
+
+### Clock-locking on Blackwell — sneaking past the 400W power-cap floor
+
+The 5090 has a **400W minimum power cap** — `nvidia-smi -pl 350` (or anything below 400W) is silently rejected on this card. That makes the power-cap-sweep methodology blind to the entire <400W envelope.
+
+[@apnar](https://github.com/noonghunna/club-3090/discussions/86#discussioncomment-16845745) ran a creative workaround: instead of setting power caps, **lock GPU SM clock + memory clock pairs** via `nvidia-smi -lgc <MHz>` and `nvidia-smi -lmc <MHz>`. Clock-locking has no minimum-power floor — you can drag the card down to 47W actual draw if you want.
+
+The result is a more efficient operating point than any power-cap sweep can find:
+
+![5090 freq-cap (clock-lock) efficiency curve (apnar)](img/freq-cap-5090-gemma4.png)
+
+*5090 air-cooled + Gemma-4-31B-AutoRound + vLLM-MTP K=3 + decode-concurrent N=6, 35-point sweep across 5 mem-clock tiers × 7 GPU-clock points each. **Top panel**: TPS climbs nearly linearly with mem clock — at 405 MHz mem (lowest), TPS caps at ~53 regardless of GPU clock; at 14001 MHz mem (max), TPS climbs through 800+ TPS at GPU 3090 MHz. **Bottom panel**: efficiency. Gold star = peak efficiency at 7001 mem / 1635 GPU MHz (2.025 TPS/W, 211W draw, 428 narr TPS) — that's **1.42× more efficient than the 400W power-cap sweet spot** (1.43 TPS/W). Blue star = Pareto point at 14001 mem / 2122 GPU MHz (1.92 TPS/W, 314W draw, 602 narr TPS) — **strictly better than the 400W cap on both axes**: +5% more TPS at -22% less power. Source script: [`img/freq-cap-5090-gemma4.py`](img/freq-cap-5090-gemma4.py). Source data: [disc #86 comment 16845745](https://github.com/noonghunna/club-3090/discussions/86#discussioncomment-16845745).*
+
+**Per-workload operating-point recommendations on 5090** (revised based on clock-lock data):
+
+| Workload | Recommended config | Mem MHz | GPU MHz | Narr TPS | Actual W | TPS/W |
+|---|---|---:|---:|---:|---:|---:|
+| **Pure efficiency target** (chat, IDE-agent, light load) | clock-lock | 7001 | 1635 | 428 | 211W | **2.025** ⭐ |
+| **Best Pareto (more TPS, less power than 400W cap)** | clock-lock | 14001 | 2122 | 602 | 314W | 1.92 |
+| Max-efficiency power cap | `nvidia-smi -pl 400` | (max) | (auto) | 571 | 400W | 1.43 |
+| Stock TDP | `nvidia-smi -pl 600` | (max) | (auto) | 600 | 547W | 1.10 |
+
+**How to apply clock-lock** on a 5090:
+
+```bash
+# Lock both clocks (the order matters — set mem first, then GPU)
+sudo nvidia-smi -lmc 7001 -i 0   # memory clock to 7001 MHz
+sudo nvidia-smi -lgc 1635 -i 0   # SM clock to 1635 MHz
+
+# Verify the lock held
+nvidia-smi --query-gpu=clocks.current.sm,clocks.current.memory \
+  --format=csv,noheader,nounits -i 0
+
+# To revert
+sudo nvidia-smi -rmc -i 0   # release memory-clock lock
+sudo nvidia-smi -rgc -i 0   # release graphics-clock lock
+```
+
+**Caveats**:
+- Clock-locking is **not portable to Ampere** — `-lmc` was removed from non-datacenter cards in some driver versions, and the 3090's voltage curve doesn't have the same headroom for sub-power-cap operation
+- This is an **air-cooled 5090 finding** — water-cooled rigs may have different optimal clock pairs (lower thermals → higher sustained boost-clock-vs-power tradeoff)
+- The freq-cap methodology hasn't been wrapped into `power-cap-sweep.sh` yet — apnar's data is hand-rolled. If you want to run a similar sweep on your 5090, copy his approach until we ship a `freq-cap-sweep.sh` companion
 
 ### Interpreting "draw plateaued below cap" sweeps
 
@@ -298,6 +407,38 @@ Then `docker compose up -d` as usual. No edits to tracked files needed.
 #### Possible secondary effect on weight-load time
 
 On the WSL2 rig where this was diagnosed, weight-load time on a fresh boot (caches cleared) was 32 sec with `expandable_segments:True` and 13 sec with `expandable_segments:False`. This is a single observation, not a controlled A/B (cache state, FS warmth and other factors weren't held constant), so treat it as suggestive rather than measured. If you're chasing boot-time latency on WSL2 and not crashing, the override is harmless to try.
+
+### Fix — `VLLM_ENFORCE_EAGER=1` for Cliff 2 GDN spike on small-VRAM rigs
+
+A third runtime failure mode separate from TDR + `expandable_segments`: at ~50-65K active context tokens, the DeltaNet GDN forward kernel produces a large activation spike that OOMs on rigs with reduced VRAM headroom. Most often hits **WSL2 / laptop GPUs** where the WSL2 boot overhead (~1.31 GiB on RTX 5090 Laptop / driver 596.36) eats into the 24 GB budget the composes assume, but can fire on any single-card config — see [`docs/CLIFFS.md`](CLIFFS.md) for the full diagnostic.
+
+**Workaround**: pass `--enforce-eager` to vLLM, which disables CUDA graphs and frees the activation memory the cliff was contesting. Tradeoff: ~20-30% TPS reduction in exchange for stable long-context behavior.
+
+Since 2026-05-07 ([PR #99](https://github.com/noonghunna/club-3090/pull/99) by @easel) all qwen3.6-27b vLLM composes expose `VLLM_ENFORCE_EAGER` as an env-var hook so you can enable the flag from gitignored `.env` instead of editing tracked files:
+
+```sh
+# models/qwen3.6-27b/vllm/compose/.env
+VLLM_ENFORCE_EAGER=1
+```
+
+Then `docker compose up -d` as usual. The bash entrypoint expands `${VLLM_ENFORCE_EAGER:+--enforce-eager}` only when the var is non-empty, so desktop users with no `.env` see zero behavior change.
+
+### Combined WSL2 / laptop `.env` template
+
+Three overrides commonly land together on WSL2 / laptop rigs (5090 Laptop validated 2026-05-07 by @easel). Drop this into `models/qwen3.6-27b/vllm/compose/.env`:
+
+```sh
+# WSL2 boot overhead caps safe gpu_memory_utilization at ~0.94 (vs 0.95 desktop default)
+GPU_MEMORY_UTILIZATION=0.94
+
+# expandable_segments:True crashes weight repack on WSL2 driver 596.36
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False,max_split_size_mb:512
+
+# Disable CUDA graphs — Cliff 2 GDN-spike workaround (~20-30% TPS cost, stable >50K ctx)
+VLLM_ENFORCE_EAGER=1
+```
+
+All three are `${VAR}`-interpolated by docker-compose at boot, so adding/removing any of them needs only an `.env` edit + recreate.
 
 ### Additional WSL2 considerations
 
